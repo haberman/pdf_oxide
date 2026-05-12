@@ -7483,6 +7483,55 @@ impl PdfDocument {
         Ok(spans)
     }
 
+    /// Extract text spans using layout-preserving positioning.
+    ///
+    /// Identical to [`extract_spans`](Self::extract_spans) but with `flush_on_every_tm`
+    /// enabled, which prevents consecutive Tm+Tj groups on the same baseline from being
+    /// merged into a single TextSpan. This preserves column and table structure for
+    /// layout-aware text extraction (e.g. financial statements, multi-column tables).
+    ///
+    /// Spans are sorted top-to-bottom, left-to-right without XY-cut reordering, so column
+    /// positions are preserved exactly as the PDF encodes them.
+    pub fn extract_positioned_spans(
+        &self,
+        page_index: usize,
+    ) -> Result<Vec<crate::layout::TextSpan>> {
+        use crate::extractors::{SpanMergingConfig, TextExtractionConfig};
+
+        let config = TextExtractionConfig {
+            merging_config: SpanMergingConfig {
+                flush_on_every_tm: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut spans = self.extract_spans_raw_with_extraction_config(page_index, config)?;
+
+        // Filter spans that lie entirely outside the page MediaBox.
+        if let Ok((llx, lly, urx, ury)) = self.get_page_media_box(page_index) {
+            const EDGE_TOLERANCE_PT: f32 = 2.0;
+            let left = llx - EDGE_TOLERANCE_PT;
+            let bottom = lly - EDGE_TOLERANCE_PT;
+            let right = urx + EDGE_TOLERANCE_PT;
+            let top = ury + EDGE_TOLERANCE_PT;
+            spans.retain(|span| {
+                let sx1 = span.bbox.x;
+                let sx2 = span.bbox.x + span.bbox.width;
+                let sy1 = span.bbox.y;
+                let sy2 = span.bbox.y + span.bbox.height;
+                sx2 > left && sx1 < right && sy2 > bottom && sy1 < top
+            });
+        }
+
+        // Simple top-to-bottom, left-to-right sort (no XY-cut so column positions
+        // are preserved as-is for callers that do their own layout analysis).
+        spans.sort_by(|a, b| {
+            crate::utils::row_aware_span_cmp(a.bbox.y, a.bbox.x, b.bbox.y, b.bbox.x)
+        });
+
+        Ok(spans)
+    }
+
     /// Return per-page font statistics for use in heading detection and layout analysis.
     ///
     /// [`crate::layout::PageFontStats`] contains:

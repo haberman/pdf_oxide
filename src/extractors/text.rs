@@ -195,6 +195,16 @@ pub struct TextExtractionConfig {
     ///
     /// **Default**: WordBoundaryMode::Tiebreaker (backward compatible)
     pub word_boundary_mode: WordBoundaryMode,
+
+    /// Span merging configuration for layout-aware extraction.
+    ///
+    /// Controls how raw TextSpans produced by the text extractor are post-processed.
+    /// Use `SpanMergingConfig { flush_on_every_tm: true, ..Default::default() }` to
+    /// preserve column and table structure by preventing consecutive Tm+Tj groups
+    /// from being merged into a single span.
+    ///
+    /// **Default**: `SpanMergingConfig::default()`
+    pub merging_config: SpanMergingConfig,
 }
 
 impl Default for TextExtractionConfig {
@@ -205,6 +215,7 @@ impl Default for TextExtractionConfig {
             word_margin_ratio: 0.1,
             use_adaptive_tj_threshold: false,
             word_boundary_mode: WordBoundaryMode::default(),
+            merging_config: SpanMergingConfig::default(),
         }
     }
 }
@@ -251,6 +262,7 @@ impl TextExtractionConfig {
             word_margin_ratio: 0.1,
             use_adaptive_tj_threshold: false, // Static threshold mode
             word_boundary_mode: WordBoundaryMode::default(),
+            merging_config: SpanMergingConfig::default(),
         }
     }
 
@@ -281,6 +293,7 @@ impl TextExtractionConfig {
             word_margin_ratio: ratio,
             use_adaptive_tj_threshold: true, // Adaptive threshold mode
             word_boundary_mode: WordBoundaryMode::default(),
+            merging_config: SpanMergingConfig::default(),
         }
     }
 
@@ -516,6 +529,20 @@ pub struct SpanMergingConfig {
     /// - Typical citation markers: 70-80% of text font size
     /// - Superscript usually: 50-80% of base font
     pub citation_font_size_ratio: f32,
+
+    /// Flush the Tj span buffer on every Tm (text matrix) operator.
+    ///
+    /// When false (default), consecutive Tm+Tj operators on the same baseline with the same
+    /// transform are batched into a single TextSpan. This optimization prevents thousands of
+    /// single-character spans in PDFs that position each character individually.
+    ///
+    /// When true, the buffer is always flushed on every Tm operator, producing one span per
+    /// positioned text group. This preserves column and table structure at the cost of more
+    /// granular output, and is required for layout-aware extraction where positioning
+    /// semantics matter (e.g., multi-column documents, financial statements).
+    ///
+    /// **Default**: false
+    pub flush_on_every_tm: bool,
 }
 
 impl Default for SpanMergingConfig {
@@ -531,6 +558,7 @@ impl Default for SpanMergingConfig {
             email_threshold_multiplier: 2.5,
             detect_citation_markers: false,
             citation_font_size_ratio: 0.75,
+            flush_on_every_tm: false,
         }
     }
 }
@@ -577,6 +605,7 @@ impl SpanMergingConfig {
             email_threshold_multiplier: 2.5,
             detect_citation_markers: false,
             citation_font_size_ratio: 0.75,
+            flush_on_every_tm: false,
         }
     }
 
@@ -610,6 +639,7 @@ impl SpanMergingConfig {
             email_threshold_multiplier: 2.5,
             detect_citation_markers: false,
             citation_font_size_ratio: 0.75,
+            flush_on_every_tm: false,
         }
     }
 
@@ -646,6 +676,7 @@ impl SpanMergingConfig {
             email_threshold_multiplier: 2.5,
             detect_citation_markers: false,
             citation_font_size_ratio: 0.75,
+            flush_on_every_tm: false,
         }
     }
 
@@ -690,6 +721,7 @@ impl SpanMergingConfig {
             email_threshold_multiplier: 2.5,
             detect_citation_markers: false,
             citation_font_size_ratio: 0.75,
+            flush_on_every_tm: false,
         }
     }
 
@@ -723,6 +755,7 @@ impl SpanMergingConfig {
             email_threshold_multiplier: 2.5,
             detect_citation_markers: false,
             citation_font_size_ratio: 0.75,
+            flush_on_every_tm: false,
         }
     }
 
@@ -766,6 +799,7 @@ impl SpanMergingConfig {
             email_threshold_multiplier: 2.5,
             detect_citation_markers: false,
             citation_font_size_ratio: 0.75,
+            flush_on_every_tm: false,
         }
     }
 }
@@ -2074,6 +2108,7 @@ impl<'doc> TextExtractor<'doc> {
     /// ```
     pub fn with_config(config: TextExtractionConfig) -> Self {
         let word_boundary_mode = config.word_boundary_mode;
+        let merging_config = config.merging_config.clone();
         Self {
             state_stack: GraphicsStateStack::new(),
             fonts: HashMap::new(),
@@ -2086,7 +2121,7 @@ impl<'doc> TextExtractor<'doc> {
             xobject_depth: 0,
             xobject_decode_count: 0,
             config,
-            merging_config: SpanMergingConfig::default(),
+            merging_config,
             current_mcid: None,
             extract_spans: true,      // Default to span mode (PDF spec compliant)
             tj_span_buffer: None,     // No buffer initially
@@ -3734,22 +3769,30 @@ impl<'doc> TextExtractor<'doc> {
                 // If the new Tm is on the same line with the same transform,
                 // keep accumulating into the existing buffer instead of flushing
                 // (avoids creating thousands of 1-char TextSpans per page).
-                let is_continuation = match self.tj_span_buffer {
-                    Some(ref mut buffer)
-                        if !buffer.is_empty()
-                            && f.round() as i32 == buffer.start_matrix.f.round() as i32
-                            && a == buffer.start_matrix.a
-                            && b == buffer.start_matrix.b
-                            && c == buffer.start_matrix.c
-                            && d == buffer.start_matrix.d
-                            && e >= buffer.start_matrix.e =>
-                    {
-                        // Same line, same transform, LTR progression →
-                        // update width to reflect actual visual extent
-                        buffer.accumulated_width = e - buffer.start_matrix.e;
-                        true
-                    },
-                    _ => false,
+                //
+                // When flush_on_every_tm is set, we always flush so that each Tm
+                // positioning group becomes its own TextSpan, preserving column and
+                // table structure for layout-aware extraction.
+                let is_continuation = if self.merging_config.flush_on_every_tm {
+                    false
+                } else {
+                    match self.tj_span_buffer {
+                        Some(ref mut buffer)
+                            if !buffer.is_empty()
+                                && f.round() as i32 == buffer.start_matrix.f.round() as i32
+                                && a == buffer.start_matrix.a
+                                && b == buffer.start_matrix.b
+                                && c == buffer.start_matrix.c
+                                && d == buffer.start_matrix.d
+                                && e >= buffer.start_matrix.e =>
+                        {
+                            // Same line, same transform, LTR progression →
+                            // update width to reflect actual visual extent
+                            buffer.accumulated_width = e - buffer.start_matrix.e;
+                            true
+                        },
+                        _ => false,
+                    }
                 };
 
                 if !is_continuation {
